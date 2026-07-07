@@ -89,7 +89,6 @@ class Database:
             self._init_mongo()
         self._init_sqlite()
 
-    # ---------- SQLite ----------
     def _init_sqlite(self):
         import sqlite3
         db_path = DATABASE_URL.replace("sqlite:///", "")
@@ -167,7 +166,6 @@ class Database:
             cur = await db.execute(query, params)
             return await cur.fetchall()
 
-    # ---------- Common CRUD ----------
     async def add_account(self, phone: Optional[str], session_data: str) -> str:
         if USE_MONGO:
             doc = {"phone": phone, "session_data": session_data,
@@ -373,9 +371,13 @@ class WhatsAppClient:
             return False
 
     async def _wait_for_login(self):
+        """Wait for QR or chat-list with extended timeout."""
         qr_selector = 'canvas[aria-label="Scan me!"]'
+        chat_selector = 'div[data-testid="chat-list"]'
+
+        # Wait for QR with 60 seconds timeout
         try:
-            await self.page.waitForSelector(qr_selector, timeout=10000)
+            await self.page.waitForSelector(qr_selector, timeout=60000)
             qr_element = await self.page.querySelector(qr_selector)
             if qr_element:
                 qr_data = await self.page.evaluate(
@@ -384,15 +386,26 @@ class WhatsAppClient:
                 )
                 self._qr_data = qr_data
                 self._qr_event.set()
+                logger.info("QR code captured and event set.")
         except PyTimeoutError:
-            pass
-        await self.page.waitForSelector('div[data-testid="chat-list"]', timeout=120000)
+            logger.warning("QR selector not found within 60 seconds, assuming already logged in?")
+            # Proceed to wait for chat-list anyway
 
-    async def get_qr(self, timeout=30):
+        # Wait for chat-list (login confirmation) - up to 2 minutes
+        try:
+            await self.page.waitForSelector(chat_selector, timeout=120000)
+            logger.info("WhatsApp Web logged in.")
+        except PyTimeoutError:
+            logger.error("Login timeout – chat-list not found.")
+            raise TimeoutError("WhatsApp login timed out.")
+
+    async def get_qr(self, timeout=60):
+        """Wait up to `timeout` seconds for QR code."""
         try:
             await asyncio.wait_for(self._qr_event.wait(), timeout)
             return self._qr_data
         except asyncio.TimeoutError:
+            logger.error(f"QR not available within {timeout} seconds.")
             return None
 
     async def _save_cookies(self):
@@ -674,7 +687,8 @@ async def add_whatsapp(update: Update, context):
     client = WhatsAppClient(account_id, db, account_data)
     active_clients[account_id] = client
     asyncio.create_task(client.start())
-    qr_data = await client.get_qr(timeout=30)
+    # Wait for QR up to 60 seconds
+    qr_data = await client.get_qr(timeout=60)
     if qr_data:
         try:
             image_data = base64.b64decode(qr_data)
