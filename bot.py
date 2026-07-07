@@ -2,7 +2,7 @@
 """
 Telegram-WhatsApp Bridge Bot - Production Ready.
 WhatsApp Web automation via pyppeteer (Chromium).
-All secrets must be set via environment variables.
+All secrets via environment variables.
 """
 
 import asyncio
@@ -12,13 +12,12 @@ import logging
 import os
 import re
 import sys
-import uuid
 from datetime import datetime
 from io import BytesIO
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Any
 
-# ===== Environment (Mandatory) =====
 from dotenv import load_dotenv
+
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -27,7 +26,6 @@ if not BOT_TOKEN or not OWNER_ID:
     raise ValueError("BOT_TOKEN and OWNER_ID must be set in environment.")
 OWNER_ID = int(OWNER_ID)
 
-# ===== Logging =====
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -36,7 +34,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ===== Telegram =====
+# ---- Telegram ----
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -49,7 +47,7 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest
 
-# ===== Database =====
+# ---- Database ----
 import aiosqlite
 try:
     import pymongo
@@ -59,50 +57,52 @@ except ImportError:
     MONGO_AVAILABLE = False
     ObjectId = None
 
-# ===== WhatsApp Automation =====
+# ---- WhatsApp ----
 from pyppeteer import launch
 from pyppeteer.errors import TimeoutError as PyTimeoutError
 
-# ===== Image handling =====
+# ---- Image ----
 from PIL import Image
 
-# ===== Config =====
+# ---- Health server ----
+from aiohttp import web
+
+# ---- Config ----
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///whatsapp_bot.db")
 MONGO_URI = os.getenv("MONGO_URI", "")
 USE_MONGO = MONGO_AVAILABLE and bool(MONGO_URI)
 CHROME_PATH = os.getenv("CHROME_PATH", None)
 SESSION_DIR = os.path.join(os.getcwd(), "sessions")
 os.makedirs(SESSION_DIR, exist_ok=True)
+PORT = int(os.getenv("PORT", "8080"))
 
-# ===== Database Layer =====
+# ============================================================================
+# DATABASE LAYER (SQLite + MongoDB)
+# ============================================================================
 class Database:
-    """Async SQLite + optional MongoDB interface with unified string IDs."""
-
-    def __init__(self, db_url: str):
-        self.db_url = db_url
+    def __init__(self):
         self._mongo_client = None
         self._mongo_db = None
         if USE_MONGO:
             self._mongo_client = pymongo.MongoClient(MONGO_URI)
             self._mongo_db = self._mongo_client.get_database()
-            self._init_mongo_sync()
-        self._init_sqlite_sync()
+            self._init_mongo()
+        self._init_sqlite()
 
-    def _init_sqlite_sync(self):
+    # ---------- SQLite ----------
+    def _init_sqlite(self):
         import sqlite3
-        db_path = self.db_url.replace("sqlite:///", "")
+        db_path = DATABASE_URL.replace("sqlite:///", "")
         conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        cursor.execute("""
+        c = conn.cursor()
+        c.executescript("""
             CREATE TABLE IF NOT EXISTS accounts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 phone TEXT,
                 session_data TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 last_used TEXT
-            )
-        """)
-        cursor.execute("""
+            );
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 account_id INTEGER,
@@ -114,13 +114,11 @@ class Database:
                 read INTEGER DEFAULT 0,
                 delivered INTEGER DEFAULT 0,
                 FOREIGN KEY(account_id) REFERENCES accounts(id)
-            )
-        """)
-        cursor.execute("""
+            );
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT
-            )
+            );
         """)
         defaults = {
             "notifications": "true",
@@ -131,18 +129,15 @@ class Database:
             "session_timeout": "3600",
         }
         for k, v in defaults.items():
-            cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
+            c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
         conn.commit()
         conn.close()
 
-    def _init_mongo_sync(self):
+    def _init_mongo(self):
         if self._mongo_db:
-            if "accounts" not in self._mongo_db.list_collection_names():
-                self._mongo_db.create_collection("accounts")
-            if "messages" not in self._mongo_db.list_collection_names():
-                self._mongo_db.create_collection("messages")
-            if "settings" not in self._mongo_db.list_collection_names():
-                self._mongo_db.create_collection("settings")
+            for col in ["accounts", "messages", "settings"]:
+                if col not in self._mongo_db.list_collection_names():
+                    self._mongo_db.create_collection(col)
             defaults = {
                 "notifications": "true",
                 "otp_highlight": "true",
@@ -156,39 +151,34 @@ class Database:
                     {"key": k}, {"$set": {"value": v}}, upsert=True
                 )
 
-    async def get_connection(self):
-        return await aiosqlite.connect(self.db_url.replace("sqlite:///", ""))
+    async def _sqlite_execute(self, query: str, params: tuple = ()):
+        async with aiosqlite.connect(DATABASE_URL.replace("sqlite:///", "")) as db:
+            cur = await db.execute(query, params)
+            await db.commit()
+            return cur
 
-    def _to_str_id(self, doc_id) -> str:
-        if isinstance(doc_id, int):
-            return str(doc_id)
-        if ObjectId and isinstance(doc_id, ObjectId):
-            return str(doc_id)
-        return str(doc_id)
+    async def _sqlite_fetchone(self, query: str, params: tuple = ()):
+        async with aiosqlite.connect(DATABASE_URL.replace("sqlite:///", "")) as db:
+            cur = await db.execute(query, params)
+            return await cur.fetchone()
 
-    def _to_internal_id(self, str_id: str):
-        if not USE_MONGO:
-            return int(str_id)
-        return ObjectId(str_id)
+    async def _sqlite_fetchall(self, query: str, params: tuple = ()):
+        async with aiosqlite.connect(DATABASE_URL.replace("sqlite:///", "")) as db:
+            cur = await db.execute(query, params)
+            return await cur.fetchall()
 
+    # ---------- Common CRUD ----------
     async def add_account(self, phone: Optional[str], session_data: str) -> str:
         if USE_MONGO:
-            doc = {
-                "phone": phone,
-                "session_data": session_data,
-                "created_at": datetime.utcnow().isoformat(),
-                "last_used": None,
-            }
-            res = self._mongo_db.accounts.insert_one(doc)
-            return str(res.inserted_id)
+            doc = {"phone": phone, "session_data": session_data,
+                   "created_at": datetime.utcnow().isoformat(), "last_used": None}
+            return str(self._mongo_db.accounts.insert_one(doc).inserted_id)
         else:
-            async with await self.get_connection() as db:
-                cursor = await db.execute(
-                    "INSERT INTO accounts (phone, session_data, created_at) VALUES (?, ?, ?)",
-                    (phone, session_data, datetime.utcnow().isoformat()),
-                )
-                await db.commit()
-                return str(cursor.lastrowid)
+            cur = await self._sqlite_execute(
+                "INSERT INTO accounts (phone, session_data, created_at) VALUES (?, ?, ?)",
+                (phone, session_data, datetime.utcnow().isoformat())
+            )
+            return str(cur.lastrowid)
 
     async def get_account(self, account_id: str) -> Optional[Dict]:
         if USE_MONGO:
@@ -199,78 +189,47 @@ class Database:
                 return doc
             return None
         else:
-            async with await self.get_connection() as db:
-                async with db.execute(
-                    "SELECT id, phone, session_data, created_at, last_used FROM accounts WHERE id = ?",
-                    (int(account_id),),
-                ) as cursor:
-                    row = await cursor.fetchone()
-                    if row:
-                        return {
-                            "id": str(row[0]),
-                            "phone": row[1],
-                            "session_data": row[2],
-                            "created_at": row[3],
-                            "last_used": row[4],
-                        }
-                    return None
+            row = await self._sqlite_fetchone(
+                "SELECT id, phone, session_data, created_at, last_used FROM accounts WHERE id = ?",
+                (int(account_id),)
+            )
+            if row:
+                return {"id": str(row[0]), "phone": row[1], "session_data": row[2],
+                        "created_at": row[3], "last_used": row[4]}
+            return None
 
     async def get_all_accounts(self) -> List[Dict]:
         if USE_MONGO:
-            docs = self._mongo_db.accounts.find()
-            return [{**doc, "id": str(doc["_id"])} for doc in docs]
+            return [{**d, "id": str(d["_id"])} for d in self._mongo_db.accounts.find()]
         else:
-            async with await self.get_connection() as db:
-                async with db.execute(
-                    "SELECT id, phone, session_data, created_at, last_used FROM accounts"
-                ) as cursor:
-                    rows = await cursor.fetchall()
-                    return [
-                        {
-                            "id": str(r[0]),
-                            "phone": r[1],
-                            "session_data": r[2],
-                            "created_at": r[3],
-                            "last_used": r[4],
-                        }
-                        for r in rows
-                    ]
+            rows = await self._sqlite_fetchall("SELECT id, phone, session_data, created_at, last_used FROM accounts")
+            return [{"id": str(r[0]), "phone": r[1], "session_data": r[2],
+                     "created_at": r[3], "last_used": r[4]} for r in rows]
 
     async def update_account_last_used(self, account_id: str):
         if USE_MONGO:
             self._mongo_db.accounts.update_one(
                 {"_id": ObjectId(account_id)},
-                {"$set": {"last_used": datetime.utcnow().isoformat()}},
+                {"$set": {"last_used": datetime.utcnow().isoformat()}}
             )
         else:
-            async with await self.get_connection() as db:
-                await db.execute(
-                    "UPDATE accounts SET last_used = ? WHERE id = ?",
-                    (datetime.utcnow().isoformat(), int(account_id)),
-                )
-                await db.commit()
+            await self._sqlite_execute(
+                "UPDATE accounts SET last_used = ? WHERE id = ?",
+                (datetime.utcnow().isoformat(), int(account_id))
+            )
 
     async def delete_account(self, account_id: str):
         if USE_MONGO:
             self._mongo_db.accounts.delete_one({"_id": ObjectId(account_id)})
             self._mongo_db.messages.delete_many({"account_id": account_id})
         else:
-            async with await self.get_connection() as db:
-                await db.execute("DELETE FROM messages WHERE account_id = ?", (int(account_id),))
-                await db.execute("DELETE FROM accounts WHERE id = ?", (int(account_id),))
-                await db.commit()
+            await self._sqlite_execute("DELETE FROM messages WHERE account_id = ?", (int(account_id),))
+            await self._sqlite_execute("DELETE FROM accounts WHERE id = ?", (int(account_id),))
 
-    async def save_message(
-        self,
-        account_id: str,
-        from_number: str,
-        from_name: str,
-        content: str,
-        timestamp: str,
-        is_otp: bool = False,
-    ):
+    async def save_message(self, account_id: str, from_number: str, from_name: str,
+                           content: str, timestamp: str, is_otp: bool = False):
         if USE_MONGO:
-            doc = {
+            self._mongo_db.messages.insert_one({
                 "account_id": account_id,
                 "from_number": from_number,
                 "from_name": from_name,
@@ -279,63 +238,27 @@ class Database:
                 "is_otp": 1 if is_otp else 0,
                 "read": 0,
                 "delivered": 0,
-            }
-            self._mongo_db.messages.insert_one(doc)
+            })
         else:
-            async with await self.get_connection() as db:
-                await db.execute(
-                    """
-                    INSERT INTO messages (account_id, from_number, from_name, content, timestamp, is_otp)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (int(account_id), from_number, from_name, content, timestamp, 1 if is_otp else 0),
-                )
-                await db.commit()
+            await self._sqlite_execute(
+                """INSERT INTO messages (account_id, from_number, from_name, content, timestamp, is_otp)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (int(account_id), from_number, from_name, content, timestamp, 1 if is_otp else 0)
+            )
 
     async def get_messages(self, account_id: str, limit: int = 50) -> List[Dict]:
         if USE_MONGO:
-            docs = (
-                self._mongo_db.messages.find({"account_id": account_id})
-                .sort("timestamp", -1)
-                .limit(limit)
-            )
-            return [
-                {
-                    "id": str(d["_id"]),
-                    "from_number": d["from_number"],
-                    "from_name": d["from_name"],
-                    "content": d["content"],
-                    "timestamp": d["timestamp"],
-                    "is_otp": bool(d["is_otp"]),
-                    "read": bool(d["read"]),
-                }
-                for d in docs
-            ]
+            docs = self._mongo_db.messages.find({"account_id": account_id}).sort("timestamp", -1).limit(limit)
+            return [{**d, "id": str(d["_id"])} for d in docs]
         else:
-            async with await self.get_connection() as db:
-                async with db.execute(
-                    """
-                    SELECT id, from_number, from_name, content, timestamp, is_otp, read
-                    FROM messages
-                    WHERE account_id = ?
-                    ORDER BY timestamp DESC
-                    LIMIT ?
-                    """,
-                    (int(account_id), limit),
-                ) as cursor:
-                    rows = await cursor.fetchall()
-                    return [
-                        {
-                            "id": str(r[0]),
-                            "from_number": r[1],
-                            "from_name": r[2],
-                            "content": r[3],
-                            "timestamp": r[4],
-                            "is_otp": bool(r[5]),
-                            "read": bool(r[6]),
-                        }
-                        for r in rows
-                    ]
+            rows = await self._sqlite_fetchall(
+                """SELECT id, from_number, from_name, content, timestamp, is_otp, read
+                   FROM messages WHERE account_id = ? ORDER BY timestamp DESC LIMIT ?""",
+                (int(account_id), limit)
+            )
+            return [{"id": str(r[0]), "from_number": r[1], "from_name": r[2],
+                     "content": r[3], "timestamp": r[4], "is_otp": bool(r[5]), "read": bool(r[6])}
+                    for r in rows]
 
     async def mark_messages_read(self, account_id: str, message_ids: List[str]):
         if USE_MONGO:
@@ -346,55 +269,44 @@ class Database:
         else:
             ids = [int(mid) for mid in message_ids]
             placeholders = ",".join("?" * len(ids))
-            async with await self.get_connection() as db:
-                await db.execute(
-                    f"UPDATE messages SET read = 1 WHERE id IN ({placeholders}) AND account_id = ?",
-                    (*ids, int(account_id)),
-                )
-                await db.commit()
+            await self._sqlite_execute(
+                f"UPDATE messages SET read = 1 WHERE id IN ({placeholders}) AND account_id = ?",
+                (*ids, int(account_id))
+            )
 
     async def get_settings(self) -> Dict[str, str]:
         if USE_MONGO:
-            docs = self._mongo_db.settings.find()
-            return {d["key"]: d["value"] for d in docs}
+            return {d["key"]: d["value"] for d in self._mongo_db.settings.find()}
         else:
-            async with await self.get_connection() as db:
-                async with db.execute("SELECT key, value FROM settings") as cursor:
-                    rows = await cursor.fetchall()
-                    return {r[0]: r[1] for r in rows}
+            rows = await self._sqlite_fetchall("SELECT key, value FROM settings")
+            return {r[0]: r[1] for r in rows}
 
     async def set_setting(self, key: str, value: str):
         if USE_MONGO:
-            self._mongo_db.settings.update_one(
-                {"key": key}, {"$set": {"value": value}}, upsert=True
-            )
+            self._mongo_db.settings.update_one({"key": key}, {"$set": {"value": value}}, upsert=True)
         else:
-            async with await self.get_connection() as db:
-                await db.execute(
-                    "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-                    (key, value),
-                )
-                await db.commit()
+            await self._sqlite_execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                (key, value)
+            )
 
     async def get_stats(self, account_id: str) -> Dict:
         if USE_MONGO:
             total = self._mongo_db.messages.count_documents({"account_id": account_id})
             otp = self._mongo_db.messages.count_documents({"account_id": account_id, "is_otp": 1})
         else:
-            async with await self.get_connection() as db:
-                async with db.execute(
-                    "SELECT COUNT(*) FROM messages WHERE account_id = ?", (int(account_id),)
-                ) as c:
-                    total = (await c.fetchone())[0]
-                async with db.execute(
-                    "SELECT COUNT(*) FROM messages WHERE account_id = ? AND is_otp = 1",
-                    (int(account_id),),
-                ) as c:
-                    otp = (await c.fetchone())[0]
+            total = (await self._sqlite_fetchone(
+                "SELECT COUNT(*) FROM messages WHERE account_id = ?", (int(account_id),)
+            ))[0]
+            otp = (await self._sqlite_fetchone(
+                "SELECT COUNT(*) FROM messages WHERE account_id = ? AND is_otp = 1", (int(account_id),)
+            ))[0]
         return {"total": total, "otp": otp}
 
 
-# ===== WhatsApp Client =====
+# ============================================================================
+# WHATSAPP CLIENT
+# ============================================================================
 class WhatsAppClient:
     def __init__(self, account_id: str, db: Database, account_data: Dict):
         self.account_id = account_id
@@ -437,19 +349,12 @@ class WhatsAppClient:
                 try:
                     cookies = json.loads(session_data)
                     await self.page.setCookie(*cookies)
-                    logger.info(f"Loaded session cookies for account {self.account_id}")
                 except Exception as e:
                     logger.error(f"Failed to load cookies: {e}")
 
             await self.page.goto("https://web.whatsapp.com", waitUntil="networkidle0", timeout=30000)
-
-            logged_in = await self._check_logged_in()
-            if not logged_in:
-                logger.info("Waiting for login...")
+            if not await self._check_logged_in():
                 await self._wait_for_login()
-            else:
-                logger.info("Already logged in.")
-
             await self._save_cookies()
             self.running = True
             self.listening_task = asyncio.create_task(self._listen_loop())
@@ -481,7 +386,6 @@ class WhatsAppClient:
                 self._qr_event.set()
         except PyTimeoutError:
             pass
-
         await self.page.waitForSelector('div[data-testid="chat-list"]', timeout=120000)
 
     async def get_qr(self, timeout=30):
@@ -497,15 +401,13 @@ class WhatsAppClient:
         if USE_MONGO:
             self.db._mongo_db.accounts.update_one(
                 {"_id": ObjectId(self.account_id)},
-                {"$set": {"session_data": session_data}},
+                {"$set": {"session_data": session_data}}
             )
         else:
-            async with await self.db.get_connection() as conn:
-                await conn.execute(
-                    "UPDATE accounts SET session_data = ? WHERE id = ?",
-                    (session_data, int(self.account_id)),
-                )
-                await conn.commit()
+            await self.db._sqlite_execute(
+                "UPDATE accounts SET session_data = ? WHERE id = ?",
+                (session_data, int(self.account_id))
+            )
         logger.info(f"Cookies saved for account {self.account_id}")
 
     async def _listen_loop(self):
@@ -513,8 +415,7 @@ class WhatsAppClient:
             try:
                 await self._check_new_messages()
             except Exception as e:
-                logger.error(f"Listen loop error for {self.account_id}: {e}")
-                await asyncio.sleep(10)
+                logger.error(f"Listen loop error: {e}")
             await asyncio.sleep(8)
 
     async def _health_check_loop(self):
@@ -557,14 +458,14 @@ class WhatsAppClient:
                             msg["name"],
                             msg["content"],
                             msg["timestamp"],
-                            is_otp,
+                            is_otp
                         )
                         settings = await self.db.get_settings()
                         if not is_otp or settings.get("otp_highlight") == "true":
                             await self._notify_telegram(msg, is_otp)
                 await self._mark_all_read()
         except Exception as e:
-            logger.error(f"Error reading messages for {self.account_id}: {e}")
+            logger.error(f"Error reading messages: {e}")
 
     async def _mark_all_read(self):
         try:
@@ -574,7 +475,6 @@ class WhatsAppClient:
             pass
 
     async def _notify_telegram(self, msg: Dict, is_otp: bool):
-        global message_queue
         await message_queue.put({
             "account_id": self.account_id,
             "from_name": msg["name"],
@@ -616,8 +516,6 @@ class WhatsAppClient:
                 if file_input:
                     await file_input.uploadFile(file_path)
                     await asyncio.sleep(2)
-                    if caption:
-                        pass
                     send_btn = await self.page.querySelector('span[data-testid="send"]')
                     if send_btn:
                         await send_btn.click()
@@ -629,18 +527,13 @@ class WhatsAppClient:
 
     async def logout(self):
         self.running = False
-        if self.listening_task:
-            self.listening_task.cancel()
-            try:
-                await self.listening_task
-            except asyncio.CancelledError:
-                pass
-        if self.health_check_task:
-            self.health_check_task.cancel()
-            try:
-                await self.health_check_task
-            except asyncio.CancelledError:
-                pass
+        for task in [self.listening_task, self.health_check_task]:
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         if self.page:
             await self.page.close()
         if self.browser:
@@ -650,18 +543,15 @@ class WhatsAppClient:
                 {"_id": ObjectId(self.account_id)}, {"$set": {"session_data": ""}}
             )
         else:
-            async with await self.db.get_connection() as conn:
-                await conn.execute(
-                    "UPDATE accounts SET session_data = '' WHERE id = ?", (int(self.account_id),)
-                )
-                await conn.commit()
+            await self.db._sqlite_execute(
+                "UPDATE accounts SET session_data = '' WHERE id = ?", (int(self.account_id),)
+            )
         logger.info(f"Logged out account {self.account_id}")
 
     async def refresh(self):
         if self.page:
             await self.page.reload(waitUntil="networkidle0")
             if not await self._check_logged_in():
-                logger.warning(f"Session lost for {self.account_id}, waiting for login...")
                 await self._wait_for_login()
 
     async def restart(self):
@@ -670,15 +560,16 @@ class WhatsAppClient:
         await self.start()
 
 
-# ===== Telegram Bot =====
+# ============================================================================
+# TELEGRAM BOT
+# ============================================================================
 message_queue = asyncio.Queue()
 active_clients: Dict[str, WhatsAppClient] = {}
-db = None
+db = Database()
 bot_app = None
 background_tasks = set()
 
-SEND_PHONE_STATE = 1
-SEND_TEXT_STATE = 2
+SEND_PHONE_STATE, SEND_TEXT_STATE = 1, 2
 
 def is_owner(update: Update) -> bool:
     return update.effective_user.id == OWNER_ID
@@ -692,33 +583,21 @@ def format_message_summary(msg: Dict) -> str:
     )
 
 def get_main_menu_keyboard() -> InlineKeyboardMarkup:
-    keyboard = [
-        [
-            InlineKeyboardButton("🏠 Home", callback_data="home"),
-            InlineKeyboardButton("➕ Add WhatsApp", callback_data="add_whatsapp"),
-        ],
-        [
-            InlineKeyboardButton("📱 Connected Accounts", callback_data="list_accounts"),
-            InlineKeyboardButton("🔄 Refresh", callback_data="refresh"),
-        ],
-        [
-            InlineKeyboardButton("📤 Send Message", callback_data="send_message"),
-            InlineKeyboardButton("💬 Inbox", callback_data="inbox"),
-        ],
-        [
-            InlineKeyboardButton("📊 Statistics", callback_data="stats"),
-            InlineKeyboardButton("⚙ Settings", callback_data="settings"),
-        ],
-        [
-            InlineKeyboardButton("🗑 Remove Account", callback_data="remove_account"),
-            InlineKeyboardButton("🚪 Logout", callback_data="logout"),
-        ],
-        [
-            InlineKeyboardButton("❓ Help", callback_data="help"),
-        ],
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🏠 Home", callback_data="home"),
+         InlineKeyboardButton("➕ Add WhatsApp", callback_data="add_whatsapp")],
+        [InlineKeyboardButton("📱 Connected Accounts", callback_data="list_accounts"),
+         InlineKeyboardButton("🔄 Refresh", callback_data="refresh")],
+        [InlineKeyboardButton("📤 Send Message", callback_data="send_message"),
+         InlineKeyboardButton("💬 Inbox", callback_data="inbox")],
+        [InlineKeyboardButton("📊 Statistics", callback_data="stats"),
+         InlineKeyboardButton("⚙ Settings", callback_data="settings")],
+        [InlineKeyboardButton("🗑 Remove Account", callback_data="remove_account"),
+         InlineKeyboardButton("🚪 Logout", callback_data="logout")],
+        [InlineKeyboardButton("❓ Help", callback_data="help")],
+    ])
 
+# ---------- Handlers ----------
 async def start(update: Update, context):
     if not is_owner(update):
         await update.message.reply_text("⛔ Unauthorized.")
@@ -761,9 +640,7 @@ async def button_callback(update: Update, context):
         elif data.startswith("select_account_"):
             account_id = data.split("_")[2]
             context.user_data["selected_account"] = account_id
-            await query.edit_message_text(
-                f"📱 Selected account ID {account_id}.", reply_markup=get_main_menu_keyboard()
-            )
+            await query.edit_message_text(f"📱 Selected account ID {account_id}.", reply_markup=get_main_menu_keyboard())
         elif data.startswith("remove_account_"):
             account_id = data.split("_")[2]
             await confirm_remove(update, context, account_id)
@@ -871,10 +748,10 @@ async def send_text_final(update: Update, context):
         await update.message.reply_text("❌ Account not active.")
         return ConversationHandler.END
     success = await client.send_text(phone, text)
-    if success:
-        await update.message.reply_text("✅ Message sent!", reply_markup=get_main_menu_keyboard())
-    else:
-        await update.message.reply_text("❌ Failed to send.", reply_markup=get_main_menu_keyboard())
+    await update.message.reply_text(
+        "✅ Message sent!" if success else "❌ Failed to send.",
+        reply_markup=get_main_menu_keyboard()
+    )
     return ConversationHandler.END
 
 async def inbox(update: Update, context):
@@ -923,22 +800,16 @@ async def settings_menu(update: Update, context):
         [InlineKeyboardButton(f"🔄 AutoReconn: {'ON' if settings.get('auto_reconnect')=='true' else 'OFF'}", callback_data="settings_auto_reconnect")],
         [InlineKeyboardButton("🔙 Back", callback_data="home")],
     ]
-    await update.callback_query.edit_message_text(
-        "⚙ Settings", reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    await update.callback_query.edit_message_text("⚙ Settings", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def remove_account_prompt(update: Update, context):
     accounts = await db.get_all_accounts()
     if not accounts:
         await update.callback_query.edit_message_text("No accounts.", reply_markup=get_main_menu_keyboard())
         return
-    keyboard = []
-    for acc in accounts:
-        keyboard.append([InlineKeyboardButton(f"Remove {acc['id']} ({acc['phone'] or 'No phone'})", callback_data=f"remove_account_{acc['id']}")])
+    keyboard = [[InlineKeyboardButton(f"Remove {acc['id']} ({acc['phone'] or 'No phone'})", callback_data=f"remove_account_{acc['id']}")] for acc in accounts]
     keyboard.append([InlineKeyboardButton("Cancel", callback_data="home")])
-    await update.callback_query.edit_message_text(
-        "Select account to remove:", reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    await update.callback_query.edit_message_text("Select account to remove:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def confirm_remove(update: Update, context, account_id: str):
     context.user_data["remove_account_id"] = account_id
@@ -946,19 +817,14 @@ async def confirm_remove(update: Update, context, account_id: str):
         [InlineKeyboardButton("✅ Yes, remove", callback_data="confirm_remove")],
         [InlineKeyboardButton("❌ Cancel", callback_data="cancel_remove")],
     ]
-    await update.callback_query.edit_message_text(
-        f"⚠️ Remove account {account_id}?",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+    await update.callback_query.edit_message_text(f"⚠️ Remove account {account_id}?", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def do_remove_account(update: Update, context, account_id: str):
     if account_id in active_clients:
         await active_clients[account_id].logout()
         del active_clients[account_id]
     await db.delete_account(account_id)
-    await update.callback_query.edit_message_text(
-        f"✅ Account {account_id} removed.", reply_markup=get_main_menu_keyboard()
-    )
+    await update.callback_query.edit_message_text(f"✅ Account {account_id} removed.", reply_markup=get_main_menu_keyboard())
     context.user_data.pop("remove_account_id", None)
 
 async def logout_account(update: Update, context):
@@ -986,9 +852,7 @@ async def help_command(update: Update, context):
         "- OTP detection.\n"
         "Use the menu to navigate."
     )
-    await update.callback_query.edit_message_text(
-        text, parse_mode=ParseMode.MARKDOWN, reply_markup=get_main_menu_keyboard()
-    )
+    await update.callback_query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=get_main_menu_keyboard())
 
 async def message_notifier(stop_event: asyncio.Event):
     while not stop_event.is_set():
@@ -1004,17 +868,23 @@ async def message_notifier(stop_event: asyncio.Event):
         except Exception as e:
             logger.error(f"Notifier error: {e}")
 
-# ===== Main =====
-async def main():
-    global db, bot_app
-    db = Database(DATABASE_URL)
+# ---------- Health Server ----------
+async def health_handler(request):
+    return web.Response(text="OK")
 
-    request = HTTPXRequest(
-        connect_timeout=30.0,
-        read_timeout=30.0,
-        write_timeout=30.0,
-        pool_timeout=30.0,
-    )
+async def start_health_server():
+    app = web.Application()
+    app.router.add_get('/health', health_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    logger.info(f"Health check server running on port {PORT}")
+
+# ---------- Main ----------
+async def main():
+    global bot_app
+    request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0, write_timeout=30.0, pool_timeout=30.0)
     application = Application.builder().token(BOT_TOKEN).request(request).build()
     bot_app = application
 
@@ -1031,6 +901,10 @@ async def main():
     )
     application.add_handler(conv_handler)
 
+    # Start health server
+    asyncio.create_task(start_health_server())
+
+    # Notifier task
     stop_event = asyncio.Event()
     notifier_task = asyncio.create_task(message_notifier(stop_event))
     background_tasks.add(notifier_task)
@@ -1040,9 +914,10 @@ async def main():
     await application.updater.start_polling()
     logger.info("Bot is running. Press Ctrl+C to stop.")
 
+    # Restore WhatsApp sessions
     accounts = await db.get_all_accounts()
     for acc in accounts:
-        if acc["session_data"] and acc["session_data"] not in ("{}", ""):
+        if acc.get("session_data") and acc["session_data"] not in ("{}", ""):
             client = WhatsAppClient(acc["id"], db, acc)
             active_clients[acc["id"]] = client
             asyncio.create_task(client.start())
